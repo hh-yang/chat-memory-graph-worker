@@ -275,10 +275,6 @@ def find_span(full_text: str, snippet: str) -> Tuple[int, int]:
 # OPENAI EXTRACTION (robust JSON parsing)
 # =========================
 def _extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Best-effort: pull the first top-level JSON object from text.
-    Works even if the model accidentally adds preamble.
-    """
     text = text.strip()
     if text.startswith("{") and text.endswith("}"):
         return json.loads(text)
@@ -293,7 +289,7 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
 def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     """
     Uses OpenAI to extract decisions. Returns list[dict] compatible with ExtractedDecision.
-    Avoids response_format args (SDK mismatch); parses JSON ourselves + validates with Pydantic.
+    Parses JSON ourselves (avoids SDK response_format mismatch) and validates with Pydantic.
     """
     if openai_client is None:
         return []
@@ -307,14 +303,14 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
         "A decision is an explicit commitment/choice (tool selection, plan, route, constraint).\n"
         "Return ONLY JSON with this exact shape:\n"
         "{\n"
-        '  "decisions": [\n'
+        '  \"decisions\": [\n'
         "    {\n"
-        '      "title": string,\n'
-        '      "status": "open" | "closed" | "revised",\n'
-        '      "rationale": string,\n'
-        '      "confidence": number (0..1),\n'
-        '      "entities": [{"name": string, "type": string}],\n'
-        '      "evidence": [{"message_id": string, "snippet": string}]\n'
+        '      \"title\": string,\n'
+        '      \"status\": \"open\" | \"closed\" | \"revised\",\n'
+        '      \"rationale\": string,\n'
+        '      \"confidence\": number (0..1),\n'
+        '      \"entities\": [{\"name\": string, \"type\": string}],\n'
+        '      \"evidence\": [{\"message_id\": string, \"snippet\": string}]\n'
         "    }\n"
         "  ]\n"
         "}\n"
@@ -332,7 +328,6 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
         ],
     }
 
-    # Try twice: if first parse fails, retry once with stricter reminder
     for attempt in range(2):
         resp = openai_client.responses.create(
             model=OPENAI_MODEL,
@@ -448,7 +443,7 @@ async def process_job(job_id: str, user_id: str, signed_url: str):
       1) Download export via signed URL (JSON or ZIP)
       2) Parse into canonical messages
       3) Extract decisions/entities/evidence
-      4) Write Neo4j graph (optional)
+      4) Write Neo4j graph
       5) Call worker_complete to upsert into Supabase (via Edge Function)
     """
     try:
@@ -508,13 +503,14 @@ async def process_job(job_id: str, user_id: str, signed_url: str):
                         name = (ent.get("name") or "").strip()
                         if not name:
                             continue
-                        key = re.sub(r"\s+", " ", name.lower())
+                        key = re.sub(r"\s+", " ", name.lower())[:200]
                         if key not in entities_map:
+                            # ✅ canonical_name must be NOT NULL in Supabase
                             entities_map[key] = {
                                 "id": str(uuid.uuid4()),
                                 "user_id": user_id,
                                 "name": name[:200],
-                                "canonical_name": None,
+                                "canonical_name": key,  # ✅ never null
                                 "entity_type": (ent.get("type") or "other")[:50],
                             }
 
