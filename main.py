@@ -21,7 +21,7 @@ app = FastAPI()
 # =========================
 WORKER_SECRET = os.getenv("WORKER_SHARED_SECRET", "")
 
-# Full invoke URLs for Supabase Edge Functions (set in Railway)
+# Full invoke URLs for Lovable/Supabase Edge Functions (set in Railway)
 WORKER_PROGRESS_URL = os.getenv("WORKER_PROGRESS_URL", "")
 WORKER_COMPLETE_URL = os.getenv("WORKER_COMPLETE_URL", "")
 
@@ -34,12 +34,19 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# Speed / caps
+FAST_MAX_CONVS = int(os.getenv("FAST_MAX_CONVS", "200"))         # cap conversations processed per upload
+FAST_CONTEXT_PRE = int(os.getenv("FAST_CONTEXT_PRE", "4"))       # msgs before decision-like user msg
+FAST_CONTEXT_POST = int(os.getenv("FAST_CONTEXT_POST", "2"))     # msgs after decision-like user msg
+FAST_MAX_SEGMENTS = int(os.getenv("FAST_MAX_SEGMENTS", "25"))    # cap number of segments per conversation
+MAX_CHARS_PER_MSG = int(os.getenv("MAX_CHARS_PER_MSG", "800"))   # cap chars per message sent to OpenAI
+MAX_DECISIONS_PER_CONV = int(os.getenv("MAX_DECISIONS_PER_CONV", "20"))
+
 # =========================
 # CLIENTS (startup)
 # =========================
 neo4j_driver = None
 openai_client: Optional[OpenAI] = None
-
 
 # =========================
 # REQUEST MODELS
@@ -155,7 +162,6 @@ def decode_and_load_json(content: bytes) -> Any:
                 raise ValueError("ZIP did not contain conversations.json (or any .json file).")
             content = z.read(target)
 
-    # Decode text safely
     try:
         text = content.decode("utf-8-sig")  # handles UTF-8 BOM too
     except UnicodeDecodeError:
@@ -241,25 +247,60 @@ def parse_chatgpt_export(export_json: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def build_windows(messages: List[Dict[str, str]], window_size: int = 10, stride: int = 6) -> List[List[Dict[str, str]]]:
-    n = len(messages)
-    if n <= window_size:
-        return [messages]
-    wins = []
-    i = 0
-    while i < n:
-        wins.append(messages[i : i + window_size])
-        i += stride
-    return [w for w in wins if w]
-
-
+# =========================
+# SPEED HELPERS (segments)
+# =========================
 def is_decision_like(text: str) -> bool:
-    t = text.lower()
+    t = (text or "").lower()
     keywords = [
         "we should", "i will", "i want to", "let's", "lets", "decide", "decision",
         "go with", "go down", "choose", "use ", "route", "option", "plan",
+        "next step", "let’s", "let us", "i’m going to", "i am going to"
     ]
     return any(k in t for k in keywords)
+
+
+def build_candidate_segments(messages: List[Dict[str, str]]) -> List[List[Dict[str, str]]]:
+    """
+    Build small context segments around decision-like USER messages.
+    Merge overlaps so we don't spam the model.
+    """
+    idxs = [i for i, m in enumerate(messages) if m["author"] == "user" and is_decision_like(m["text"])]
+    if not idxs:
+        return []
+
+    ranges: List[Tuple[int, int]] = []
+    n = len(messages)
+    for i in idxs:
+        start = max(0, i - FAST_CONTEXT_PRE)
+        end = min(n, i + FAST_CONTEXT_POST + 1)  # slice end
+        ranges.append((start, end))
+
+    ranges.sort()
+    merged: List[Tuple[int, int]] = []
+    cur_s, cur_e = ranges[0]
+    for s, e in ranges[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
+
+    merged = merged[:FAST_MAX_SEGMENTS]
+
+    segments: List[List[Dict[str, str]]] = []
+    for s, e in merged:
+        seg = []
+        for m in messages[s:e]:
+            seg.append({
+                "message_id": m["message_id"],
+                "author": m["author"],
+                "text": (m["text"] or "")[:MAX_CHARS_PER_MSG],
+            })
+        segments.append(seg)
+
+    return segments
 
 
 def find_span(full_text: str, snippet: str) -> Tuple[int, int]:
@@ -271,11 +312,17 @@ def find_span(full_text: str, snippet: str) -> Tuple[int, int]:
     return 0, min(len(snippet), len(full_text))
 
 
+def canonicalize_name(name: str) -> str:
+    # lower + collapse whitespace; always non-empty if name non-empty
+    key = re.sub(r"\s+", " ", (name or "").strip().lower())
+    return key[:200] if key else "unknown"
+
+
 # =========================
-# OPENAI EXTRACTION (robust JSON parsing)
+# OPENAI EXTRACTION (1 call per conversation)
 # =========================
 def _extract_json_object(text: str) -> Dict[str, Any]:
-    text = text.strip()
+    text = (text or "").strip()
     if text.startswith("{") and text.endswith("}"):
         return json.loads(text)
 
@@ -283,24 +330,26 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("No JSON object found in model output.")
-    return json.loads(text[start : end + 1])
+    return json.loads(text[start:end + 1])
 
 
-def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def extract_decisions_from_conversation(conversation_id: str, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     """
-    Uses OpenAI to extract decisions. Returns list[dict] compatible with ExtractedDecision.
-    Parses JSON ourselves (avoids SDK response_format mismatch) and validates with Pydantic.
+    1 OpenAI call per conversation:
+      - build candidate segments around decision-like user messages
+      - extract decisions/entities/evidence with strict JSON format
     """
     if openai_client is None:
         return []
 
-    # Cheap filter to cut cost
-    if not any(m["author"] == "user" and is_decision_like(m["text"]) for m in window):
+    segments = build_candidate_segments(messages)
+    if not segments:
         return []
 
     system = (
         "You extract USER DECISIONS from chat messages.\n"
         "A decision is an explicit commitment/choice (tool selection, plan, route, constraint).\n"
+        f"Return at most {MAX_DECISIONS_PER_CONV} decisions.\n"
         "Return ONLY JSON with this exact shape:\n"
         "{\n"
         '  \"decisions\": [\n'
@@ -318,15 +367,10 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
         "- Do NOT invent. If no explicit decision exists, return {\"decisions\": []}.\n"
         "- Evidence.message_id MUST be one of the provided message_ids.\n"
         "- Evidence.snippet MUST be a verbatim substring from that message.\n"
+        "- Keep titles short and specific.\n"
     )
 
-    payload = {
-        "conversation_id": conversation_id,
-        "messages": [
-            {"message_id": m["message_id"], "author": m["author"], "text": m["text"][:2000]}
-            for m in window
-        ],
-    }
+    payload = {"conversation_id": conversation_id, "segments": segments}
 
     for attempt in range(2):
         resp = openai_client.responses.create(
@@ -345,7 +389,8 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
         try:
             data = _extract_json_object(out_text)
             validated = DecisionExtraction.model_validate(data)
-            return [d.model_dump() for d in validated.decisions]
+            decisions = validated.decisions[:MAX_DECISIONS_PER_CONV]
+            return [d.model_dump() for d in decisions]
         except Exception:
             if attempt == 0:
                 system = system + "\nIMPORTANT: Output must be valid JSON only. No markdown, no commentary."
@@ -420,7 +465,6 @@ def neo4j_write_graph(
             session.run(cypher_decisions, decisions=decisions)
         if evidence:
             session.run(cypher_evidence, evidence=evidence)
-
         if about_edges:
             session.run(cypher_about, rels=about_edges)
         if supported_edges:
@@ -439,17 +483,16 @@ async def start(req: StartRequest, x_worker_secret: Optional[str] = Header(None)
 
 async def process_job(job_id: str, user_id: str, signed_url: str):
     """
-    Pipeline:
+    Fast pipeline:
       1) Download export via signed URL (JSON or ZIP)
-      2) Parse into canonical messages
-      3) Extract decisions/entities/evidence
+      2) Parse messages
+      3) 1 OpenAI call per conversation (only decision-like segments)
       4) Write Neo4j graph
       5) Call worker_complete to upsert into Supabase (via Edge Function)
     """
     try:
         await post_progress(job_id, 5, status="running")
 
-        # Download bytes
         async with httpx.AsyncClient(timeout=180) as client:
             r = await client.get(signed_url)
             r.raise_for_status()
@@ -459,6 +502,11 @@ async def process_job(job_id: str, user_id: str, signed_url: str):
         await post_progress(job_id, 15, status="running")
 
         conversations = parse_chatgpt_export(export_json)
+
+        # Fast cap
+        if FAST_MAX_CONVS > 0:
+            conversations = conversations[:FAST_MAX_CONVS]
+
         await post_progress(job_id, 25, status="running")
 
         # If OpenAI not configured, complete with empty arrays
@@ -467,7 +515,7 @@ async def process_job(job_id: str, user_id: str, signed_url: str):
             await post_complete({"job_id": job_id, "user_id": user_id, "entities": [], "decisions": [], "evidence": [], "edges": []})
             return
 
-        entities_map: Dict[str, Dict[str, Any]] = {}  # key: normalized name
+        entities_map: Dict[str, Dict[str, Any]] = {}  # key: canonical_name
         decisions_out: List[Dict[str, Any]] = []
         evidence_out: List[Dict[str, Any]] = []
         edges_out: List[Dict[str, Any]] = []
@@ -477,200 +525,57 @@ async def process_job(job_id: str, user_id: str, signed_url: str):
         for ci, conv in enumerate(conversations):
             conv_id = conv["conversation_id"]
             msgs = conv["messages"]
-            windows = build_windows(msgs, window_size=10, stride=6)
 
-            for w in windows:
-                extracted = extract_decisions_from_window(conv_id, w)
-                if not extracted:
-                    continue
+            extracted = extract_decisions_from_conversation(conv_id, msgs)
+            if not extracted:
+                # progress bump still
+                if ci % 10 == 0:
+                    pct = 25 + int(55 * (ci + 1) / total_convs)
+                    await post_progress(job_id, min(pct, 85), status="running")
+                continue
 
-                msg_by_id = {m["message_id"]: m["text"] for m in w}
+            # Evidence can refer to any message in the conversation
+            msg_by_id = {m["message_id"]: m["text"] for m in msgs}
 
-                for d in extracted:
-                    decision_id = str(uuid.uuid4())
-                    decisions_out.append({
-                        "id": decision_id,
-                        "user_id": user_id,
-                        "title": (d.get("title") or "")[:240],
-                        "status": d.get("status") or "open",
-                        "rationale": (d.get("rationale") or "")[:2000],
-                        "confidence": float(d.get("confidence") or 0.5),
-                        "decided_at": None,
-                    })
-
-                    # Entities -> Decision edges
-                    for ent in d.get("entities", []):
-                        name = (ent.get("name") or "").strip()
-                        if not name:
-                            continue
-                        key = re.sub(r"\s+", " ", name.lower())[:200]
-                        if key not in entities_map:
-                            # ✅ canonical_name must be NOT NULL in Supabase
-                            entities_map[key] = {
-                                "id": str(uuid.uuid4()),
-                                "user_id": user_id,
-                                "name": name[:200],
-                                "canonical_name": key,  # ✅ never null
-                                "entity_type": (ent.get("type") or "other")[:50],
-                            }
-
-                        edges_out.append({
-                            "id": str(uuid.uuid4()),
-                            "user_id": user_id,
-                            "from_type": "entity",
-                            "from_id": entities_map[key]["id"],
-                            "rel_type": "ABOUT",
-                            "to_type": "decision",
-                            "to_id": decision_id,
-                        })
-
-                    # Evidence -> Decision edges
-                    for ev in d.get("evidence", []):
-                        mid = (ev.get("message_id") or "").strip()
-                        snippet = (ev.get("snippet") or "").strip()
-                        if not mid or not snippet or mid not in msg_by_id:
-                            continue
-
-                        full_text = msg_by_id[mid]
-                        start_char, end_char = find_span(full_text, snippet)
-
-                        ev_id = str(uuid.uuid4())
-                        evidence_out.append({
-                            "id": ev_id,
-                            "user_id": user_id,
-                            "decision_id": decision_id,
-                            "conversation_id": conv_id,
-                            "message_id": mid,
-                            "start_char": int(start_char),
-                            "end_char": int(end_char),
-                            "snippet": snippet[:500],
-                        })
-
-                        edges_out.append({
-                            "id": str(uuid.uuid4()),
-                            "user_id": user_id,
-                            "from_type": "decision",
-                            "from_id": decision_id,
-                            "rel_type": "SUPPORTED_BY",
-                            "to_type": "evidence",
-                            "to_id": ev_id,
-                        })
-
-            # progress bump
-            if ci % 2 == 0:
-                pct = 25 + int(50 * (ci + 1) / total_convs)
-                await post_progress(job_id, min(pct, 80), status="running")
-
-        # Neo4j write
-        await post_progress(job_id, 85, status="running")
-        neo4j_write_graph(user_id, list(entities_map.values()), decisions_out, evidence_out, edges_out)
-
-        # Persist to Supabase via worker_complete
-        await post_progress(job_id, 95, status="running")
-        await post_complete({
-            "job_id": job_id,
-            "user_id": user_id,
-            "entities": list(entities_map.values()),
-            "decisions": decisions_out,
-            "evidence": evidence_out,
-            "edges": edges_out,
-        })
-
-    except Exception as e:
-        await post_progress(job_id, 0, status="failed", error=str(e))
-
-
-@app.post("/query")
-def query(req: QueryRequest, x_worker_secret: Optional[str] = Header(None)):
-    """
-    Minimal GraphRAG:
-      - match entity name by substring
-      - hop Entity -[:ABOUT]-> Decision -[:SUPPORTED_BY]-> Evidence
-      - return decision titles as answer bullets + citations
-    """
-    require_secret(x_worker_secret)
-
-    if neo4j_driver is None:
-        return {"answer": [], "results": []}
-
-    q = (req.question or "").strip()
-    if not q:
-        return {"answer": [], "results": []}
-
-    m = re.search(r"\babout\b(.+)$", q, flags=re.I)
-    entity_term = (m.group(1).strip() if m else q).strip()[:80]
-    top_k = int(req.top_k or 3)
-
-    with neo4j_driver.session() as session:
-        ents = session.run(
-            """
-            MATCH (e:Entity)
-            WHERE e.user_id = $user_id AND toLower(e.name) CONTAINS toLower($q)
-            RETURN e.id AS id, e.name AS name
-            LIMIT 5
-            """,
-            user_id=req.user_id,
-            q=entity_term
-        ).data()
-
-        if not ents:
-            return {"answer": [], "results": []}
-
-        results: List[Dict[str, Any]] = []
-
-        for ent in ents:
-            rows = session.run(
-                """
-                MATCH (e:Entity {id: $eid})-[:ABOUT]->(d:Decision)
-                WHERE d.user_id = $user_id
-                OPTIONAL MATCH (d)-[:SUPPORTED_BY]->(v:Evidence)
-                RETURN d.id AS decision_id,
-                       d.title AS title,
-                       d.status AS status,
-                       d.confidence AS confidence,
-                       collect({
-                         id: v.id,
-                         snippet: v.snippet,
-                         conversation_id: v.conversation_id,
-                         message_id: v.message_id,
-                         start_char: v.start_char,
-                         end_char: v.end_char
-                       }) AS citations
-                ORDER BY d.confidence DESC
-                LIMIT $k
-                """,
-                eid=ent["id"],
-                user_id=req.user_id,
-                k=top_k
-            ).data()
-
-            for r in rows:
-                citations = [c for c in (r.get("citations") or []) if c.get("id")]
-                path = [
-                    {"type": "Entity", "id": ent["id"], "name": ent["name"]},
-                    {"type": "Decision", "id": r["decision_id"], "title": r["title"]},
-                ]
-                if citations:
-                    c0 = citations[0]
-                    path.append({
-                        "type": "Evidence",
-                        "id": c0["id"],
-                        "snippet": c0.get("snippet"),
-                        "conversation_id": c0.get("conversation_id"),
-                        "message_id": c0.get("message_id"),
-                        "start_char": c0.get("start_char"),
-                        "end_char": c0.get("end_char"),
-                    })
-
-                results.append({
-                    "decision_id": r["decision_id"],
-                    "title": r["title"],
-                    "status": r.get("status") or "open",
-                    "confidence": r.get("confidence") or 0.0,
-                    "path": path,
-                    "citations": citations,
+            for d in extracted:
+                decision_id = str(uuid.uuid4())
+                decisions_out.append({
+                    "id": decision_id,
+                    "user_id": user_id,
+                    "title": (d.get("title") or "")[:240],
+                    "status": d.get("status") or "open",
+                    "rationale": (d.get("rationale") or "")[:2000],
+                    "confidence": float(d.get("confidence") or 0.5),
+                    "decided_at": None,
                 })
 
-        # Safe V1 answer: decision titles that have citations
-        answer = [r["title"] for r in results[:top_k] if r.get("citations")]
-        return {"answer": answer[:3], "results": results[:top_k]}
+                # Entities -> Decision edges
+                for ent in d.get("entities", []):
+                    raw_name = (ent.get("name") or "").strip()
+                    if not raw_name:
+                        continue
+
+                    canonical = canonicalize_name(raw_name)  # ✅ never null
+                    if canonical not in entities_map:
+                        entities_map[canonical] = {
+                            "id": str(uuid.uuid4()),
+                            "user_id": user_id,
+                            "name": raw_name[:200],
+                            "canonical_name": canonical,  # ✅ NOT NULL for Supabase
+                            "entity_type": (ent.get("type") or "other")[:50],
+                        }
+
+                    edges_out.append({
+                        "id": str(uuid.uuid4()),
+                        "user_id": user_id,
+                        "from_type": "entity",
+                        "from_id": entities_map[canonical]["id"],
+                        "rel_type": "ABOUT",
+                        "to_type": "decision",
+                        "to_id": decision_id,
+                    })
+
+                # Evidence -> Decision edges
+                for ev in d.get("evidence", []):
+                    mid = (ev.get("message_id") or "").strip()
+                    snippet = (ev.get("snippet") or "").strip()
