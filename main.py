@@ -272,7 +272,7 @@ def find_span(full_text: str, snippet: str) -> Tuple[int, int]:
 
 
 # =========================
-# OPENAI EXTRACTION (robust JSON parsing; no response_format param)
+# OPENAI EXTRACTION (robust JSON parsing)
 # =========================
 def _extract_json_object(text: str) -> Dict[str, Any]:
     """
@@ -283,7 +283,6 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     if text.startswith("{") and text.endswith("}"):
         return json.loads(text)
 
-    # Find the first '{' and last '}' and try that slice.
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -293,8 +292,8 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
 
 def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     """
-    Uses OpenAI to extract decisions. Returns list[dict] of ExtractedDecision.
-    Avoids SDK-specific 'response_format' args; parses JSON ourselves + validates with Pydantic.
+    Uses OpenAI to extract decisions. Returns list[dict] compatible with ExtractedDecision.
+    Avoids response_format args (SDK mismatch); parses JSON ourselves + validates with Pydantic.
     """
     if openai_client is None:
         return []
@@ -322,6 +321,7 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
         "Rules:\n"
         "- Do NOT invent. If no explicit decision exists, return {\"decisions\": []}.\n"
         "- Evidence.message_id MUST be one of the provided message_ids.\n"
+        "- Evidence.snippet MUST be a verbatim substring from that message.\n"
     )
 
     payload = {
@@ -332,7 +332,7 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
         ],
     }
 
-    # Try twice: if first parse fails, ask again with stricter reminder
+    # Try twice: if first parse fails, retry once with stricter reminder
     for attempt in range(2):
         resp = openai_client.responses.create(
             model=OPENAI_MODEL,
@@ -343,10 +343,8 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
             temperature=0.2,
         )
 
-        # Most OpenAI Python SDK versions expose output_text for Responses
-        out_text = getattr(resp, "output_text", None)
+        out_text = getattr(resp, "output_text", None) or ""
         if not out_text:
-            # fallback: stringify entire resp (best-effort)
             out_text = str(resp)
 
         try:
@@ -355,7 +353,6 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
             return [d.model_dump() for d in validated.decisions]
         except Exception:
             if attempt == 0:
-                # tighten system message and retry once
                 system = system + "\nIMPORTANT: Output must be valid JSON only. No markdown, no commentary."
                 continue
             return []
@@ -364,21 +361,36 @@ def extract_decisions_from_window(conversation_id: str, window: List[Dict[str, s
 
 
 # =========================
-# NEO4J WRITES (ABOUT + SUPPORTED_BY)
+# NEO4J WRITES (ONE STATEMENT PER RUN)
 # =========================
-def neo4j_write_graph(user_id: str, entities: List[Dict[str, Any]], decisions: List[Dict[str, Any]], evidence: List[Dict[str, Any]], edges: List[Dict[str, Any]]):
+def neo4j_write_graph(
+    user_id: str,
+    entities: List[Dict[str, Any]],
+    decisions: List[Dict[str, Any]],
+    evidence: List[Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+):
     if neo4j_driver is None:
         return
 
-    cypher_nodes = """
+    cypher_entities = """
     UNWIND $entities AS e
     MERGE (en:Entity {id: e.id})
-    SET en.user_id = e.user_id, en.name = e.name, en.entity_type = e.entity_type;
+    SET en.user_id = e.user_id,
+        en.name = e.name,
+        en.entity_type = e.entity_type
+    """
 
+    cypher_decisions = """
     UNWIND $decisions AS d
     MERGE (de:Decision {id: d.id})
-    SET de.user_id = d.user_id, de.title = d.title, de.status = d.status, de.confidence = d.confidence;
+    SET de.user_id = d.user_id,
+        de.title = d.title,
+        de.status = d.status,
+        de.confidence = d.confidence
+    """
 
+    cypher_evidence = """
     UNWIND $evidence AS v
     MERGE (ev:Evidence {id: v.id})
     SET ev.user_id = v.user_id,
@@ -386,28 +398,34 @@ def neo4j_write_graph(user_id: str, entities: List[Dict[str, Any]], decisions: L
         ev.message_id = v.message_id,
         ev.start_char = v.start_char,
         ev.end_char = v.end_char,
-        ev.snippet = v.snippet;
+        ev.snippet = v.snippet
     """
-
-    about_edges = [e for e in edges if e.get("rel_type") == "ABOUT"]
-    supported_edges = [e for e in edges if e.get("rel_type") == "SUPPORTED_BY"]
 
     cypher_about = """
     UNWIND $rels AS r
     MATCH (a:Entity {id: r.from_id})
     MATCH (b:Decision {id: r.to_id})
-    MERGE (a)-[:ABOUT]->(b);
+    MERGE (a)-[:ABOUT]->(b)
     """
 
     cypher_supported = """
     UNWIND $rels AS r
     MATCH (a:Decision {id: r.from_id})
     MATCH (b:Evidence {id: r.to_id})
-    MERGE (a)-[:SUPPORTED_BY]->(b);
+    MERGE (a)-[:SUPPORTED_BY]->(b)
     """
 
+    about_edges = [e for e in edges if e.get("rel_type") == "ABOUT"]
+    supported_edges = [e for e in edges if e.get("rel_type") == "SUPPORTED_BY"]
+
     with neo4j_driver.session() as session:
-        session.run(cypher_nodes, entities=entities, decisions=decisions, evidence=evidence)
+        if entities:
+            session.run(cypher_entities, entities=entities)
+        if decisions:
+            session.run(cypher_decisions, decisions=decisions)
+        if evidence:
+            session.run(cypher_evidence, evidence=evidence)
+
         if about_edges:
             session.run(cypher_about, rels=about_edges)
         if supported_edges:
@@ -448,7 +466,7 @@ async def process_job(job_id: str, user_id: str, signed_url: str):
         conversations = parse_chatgpt_export(export_json)
         await post_progress(job_id, 25, status="running")
 
-        # If OpenAI not configured, complete with empty arrays (keeps product usable)
+        # If OpenAI not configured, complete with empty arrays
         if openai_client is None:
             await post_progress(job_id, 90, status="running")
             await post_complete({"job_id": job_id, "user_id": user_id, "entities": [], "decisions": [], "evidence": [], "edges": []})
@@ -547,11 +565,11 @@ async def process_job(job_id: str, user_id: str, signed_url: str):
                 pct = 25 + int(50 * (ci + 1) / total_convs)
                 await post_progress(job_id, min(pct, 80), status="running")
 
-        # Write Neo4j (optional)
+        # Neo4j write
         await post_progress(job_id, 85, status="running")
         neo4j_write_graph(user_id, list(entities_map.values()), decisions_out, evidence_out, edges_out)
 
-        # Persist results into Supabase via worker_complete
+        # Persist to Supabase via worker_complete
         await post_progress(job_id, 95, status="running")
         await post_complete({
             "job_id": job_id,
